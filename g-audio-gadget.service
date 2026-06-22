@@ -1,0 +1,13 @@
+[Unit]
+Description=Load USB audio gadget (g_audio) after dwc2 UDC is ready
+After=local-fs.target
+Before=usb-voice-mic.service sound.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/methoonema/mic/load_g_audio_gadget.sh
+
+[Install]
+WantedBy=multi-user.target
