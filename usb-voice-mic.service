@@ -8,7 +8,7 @@ Wants=sound.target
 Type=simple
 User=methoonema
 WorkingDirectory=/home/methoonema/mic
-ExecStart=/home/methoonema/mic/.venv/bin/python /home/methoonema/mic/usb_voice_mic.py --input-device 0
+ExecStart=/home/methoonema/mic/.venv/bin/python /home/methoonema/mic/usb_voice_mic.py --input-device hw:0,0 --output-device hw:1,0
 Restart=on-failure
 RestartSec=3
 

@@ -23,17 +23,47 @@ from dual_mic_filter import DualMicFilter, FilterConfig
 MIC_DIR = Path(__file__).resolve().parent
 CALIBRATION_FILE = MIC_DIR / "calibration.json"
 GADGET_KEYWORDS = ("uac", "gadget", "g_audio", "usb audio gadget")
+I2S_KEYWORDS = ("googlevoicehat", "voicehat", "snd_rpi_googlevoicehat")
 
 
-def find_gadget_playback() -> int | None:
-    """Return sounddevice index for g_audio USB gadget playback (feeds host mic)."""
+def _device_name(dev: object) -> str:
+    return str(dev["name"]).lower() if isinstance(dev, dict) else str(dev).lower()
+
+
+def find_gadget_playback() -> int | str | None:
+    """Return sounddevice index for g_audio USB gadget playback (feeds host mic).
+
+    PortAudio often misreports UAC2 gadget directions (shows 1 in / 0 out for the
+    playback endpoint that feeds the host microphone). Match by name first.
+    """
+    fallback: int | str | None = None
     for idx, dev in enumerate(sd.query_devices()):
-        if dev["max_output_channels"] < 1:
+        name = _device_name(dev)
+        if not any(keyword in name for keyword in GADGET_KEYWORDS):
             continue
-        name = dev["name"].lower()
-        if any(keyword in name for keyword in GADGET_KEYWORDS):
+        if dev["max_output_channels"] >= 1:
             return idx
+        fallback = idx
+    if fallback is not None:
+        return fallback
+    for candidate in ("hw:1,0", "default:CARD=UAC2Gadget,DEV=0"):
+        try:
+            sd.query_devices(candidate)
+            return candidate
+        except Exception:
+            continue
     return None
+
+
+def find_i2s_input() -> int | str:
+    """Return the dual I2S MEMS capture device (googlevoicehat overlay)."""
+    for idx, dev in enumerate(sd.query_devices()):
+        name = _device_name(dev)
+        if any(keyword in name for keyword in I2S_KEYWORDS):
+            if dev["max_input_channels"] >= 2:
+                return idx
+            return idx
+    return "hw:0,0"
 
 
 def load_noise_scale() -> float:
@@ -44,8 +74,8 @@ def load_noise_scale() -> float:
 
 
 def run(
-    input_device: int,
-    output_device: int,
+    input_device: int | str,
+    output_device: int | str,
     config: FilterConfig,
 ) -> None:
     processor = DualMicFilter(config)
@@ -96,15 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--input-device",
-        type=int,
-        default=0,
-        help="ALSA input device (I2S mics, default: 0)",
+        default=None,
+        help="ALSA input device for I2S mics (index or hw:CARD=...,DEV=0; auto-detected if omitted)",
     )
     parser.add_argument(
         "--output-device",
-        type=int,
         default=None,
-        help="ALSA output device (USB gadget; auto-detected if omitted)",
+        help="ALSA output device for USB gadget (index or hw:1,0; auto-detected if omitted)",
     )
     parser.add_argument("--mode", choices=["noise_cancel", "beamform"], default="noise_cancel")
     parser.add_argument("--noise-scale", type=float, default=None)
@@ -124,6 +152,12 @@ def main() -> None:
         print(f"\nGadget playback device: {gadget}")
         return
 
+    input_device = args.input_device
+    if input_device is None:
+        input_device = find_i2s_input()
+    elif str(input_device).isdigit():
+        input_device = int(input_device)
+
     output_device = args.output_device
     if output_device is None:
         output_device = find_gadget_playback()
@@ -135,6 +169,8 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+    elif str(output_device).isdigit():
+        output_device = int(output_device)
 
     noise_scale = args.noise_scale if args.noise_scale is not None else load_noise_scale()
     config = FilterConfig(
@@ -143,7 +179,7 @@ def main() -> None:
         mode=args.mode,
         noise_scale=noise_scale,
     )
-    run(args.input_device, output_device, config)
+    run(input_device, output_device, config)
 
 
 if __name__ == "__main__":
