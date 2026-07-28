@@ -14,8 +14,10 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import threading
 import wave
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -24,17 +26,17 @@ from scipy import signal
 
 @dataclass
 class FilterConfig:
-    sample_rate: int = 48000  # googlevoicehat / dual INMP441 fixed rate
+    sample_rate: int = 48000      # googlevoicehat / dual INMP441 fixed rate
     block_size: int = 1024
-    mode: str = "noise_cancel"  # noise_cancel | beamform
+    mode: str = "noise_cancel"    # noise_cancel | beamform
     mic_spacing_m: float = 0.05
     beam_angle_deg: float = 0.0
     noise_scale: float = 0.85
     highpass_hz: float = 80.0
-    noise_gate_db: float = -45.0
     enable_vad: bool = True
-    vad_threshold_db: float = -40.0
+    vad_threshold_db: float = -40.0   # overridden by auto-calibration if not set explicitly
     hangover_ms: float = 300.0
+    auto_calibrate: bool = True        # measure noise floor on startup
 
 
 class DualMicFilter:
@@ -47,8 +49,17 @@ class DualMicFilter:
         )
         self._hp_state = signal.lfilter_zi(self._hp_b, self._hp_a)
         self._delay_samples = self._compute_beam_delay()
+
+        # Proper delay buffer for beamforming (fixes block-boundary click artifact)
+        self._delay_buf: np.ndarray = np.zeros(max(self._delay_samples, 1), dtype=np.float32)
+
+        # VAD hangover state
         self._hangover_samples = int((config.hangover_ms / 1000.0) * config.sample_rate)
         self._hangover_counter = 0
+
+        # Shared VAD state for status logger (Change 5)
+        self.last_rms_db: float = -80.0
+        self.vad_active: bool = False
 
     def _compute_beam_delay(self) -> int:
         """End-fire array delay for steering toward beam_angle_deg."""
@@ -58,46 +69,62 @@ class DualMicFilter:
         delay = int(round(abs(tau) * self.config.sample_rate))
         return max(0, delay)
 
+    def set_noise_floor(self, floor_db: float, margin_db: float = 8.0) -> None:
+        """Override VAD threshold based on measured ambient noise floor."""
+        self.config.vad_threshold_db = floor_db + margin_db
+        print(f"[VAD] Auto-calibrated: noise floor={floor_db:.1f}dB → threshold set to {self.config.vad_threshold_db:.1f}dB")
+
     def process_block(self, mic_primary: np.ndarray, mic_reference: np.ndarray) -> np.ndarray:
         """Process one block. mic_primary = channel 0, mic_reference = channel 1."""
         primary = mic_primary.astype(np.float32)
         reference = mic_reference.astype(np.float32)
 
         if self.config.mode == "beamform":
-            if self._delay_samples > 0:
-                reference = np.roll(reference, self._delay_samples)
-            output = 0.5 * (primary + reference)
+            output = self._beamform(primary, reference)
         else:
             output = primary - self.config.noise_scale * reference
 
         output, self._hp_state = signal.lfilter(
             self._hp_b, self._hp_a, output, zi=self._hp_state
         )
-        output = self._apply_noise_gate(output)
         output = self._apply_vad_gate(output)
         return np.clip(output, -1.0, 1.0)
 
-    def _apply_noise_gate(self, audio: np.ndarray) -> np.ndarray:
-        threshold = 10 ** (self.config.noise_gate_db / 20.0)
-        rms = np.sqrt(np.mean(audio**2) + 1e-12)
-        if rms < threshold:
-            return audio * (rms / threshold)
-        return audio
+    def _beamform(self, primary: np.ndarray, reference: np.ndarray) -> np.ndarray:
+        """Delay-and-sum beamforming using a proper delay line (no circular wrap artifacts)."""
+        if self._delay_samples == 0:
+            return 0.5 * (primary + reference)
+
+        # Prepend the saved tail from the previous block
+        delayed_ref = np.concatenate([self._delay_buf, reference])
+        # Update the delay buffer with the end of the current reference block
+        self._delay_buf = reference[-self._delay_samples:].copy()
+        # Slice the aligned portion
+        aligned_ref = delayed_ref[:len(primary)]
+        return 0.5 * (primary + aligned_ref)
 
     def _apply_vad_gate(self, audio: np.ndarray) -> np.ndarray:
+        """Gate output to silence when no human speech is detected."""
+        rms = float(np.sqrt(np.mean(audio ** 2) + 1e-12))
+        rms_db = 20.0 * np.log10(rms + 1e-12)
+        self.last_rms_db = rms_db
+
         if not self.config.enable_vad:
+            self.vad_active = True
             return audio
 
-        threshold = 10 ** (self.config.vad_threshold_db / 20.0)
-        rms = np.sqrt(np.mean(audio**2) + 1e-12)
+        threshold_linear = 10 ** (self.config.vad_threshold_db / 20.0)
 
-        if rms >= threshold:
+        if rms >= threshold_linear:
             self._hangover_counter = self._hangover_samples
+            self.vad_active = True
             return audio
         elif self._hangover_counter > 0:
             self._hangover_counter -= len(audio)
+            self.vad_active = True
             return audio
         else:
+            self.vad_active = False
             return np.zeros_like(audio)
 
 
