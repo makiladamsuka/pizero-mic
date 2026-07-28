@@ -138,6 +138,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noise-scale", type=float, default=None)
     parser.add_argument("--sample-rate", type=int, default=48000)
     parser.add_argument("--block-size", type=int, default=2048)
+    parser.add_argument("--no-vad", action="store_true", help="Disable VAD silence gating")
+    parser.add_argument("--vad-threshold-db", type=float, default=-40.0, help="VAD RMS threshold in dB")
+    parser.add_argument("--hangover-ms", type=float, default=300.0, help="VAD speech hangover hold time in ms")
     parser.add_argument("--list-devices", action="store_true")
     return parser
 
@@ -163,9 +166,8 @@ def main() -> None:
         output_device = find_gadget_playback()
         if output_device is None:
             print(
-                "USB audio gadget not found. Run setup first:\n"
-                "  sudo ./setup_usb_gadget.sh\n"
-                "Then reboot and plug the Pi into your PC via USB.",
+                "Error: USB gadget playback device not found. "
+                "Ensure setup_usb_gadget.sh ran and g_audio module is loaded.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -178,7 +180,11 @@ def main() -> None:
         block_size=args.block_size,
         mode=args.mode,
         noise_scale=noise_scale,
+        enable_vad=not args.no_vad,
+        vad_threshold_db=args.vad_threshold_db,
+        hangover_ms=args.hangover_ms,
     )
+
     run(input_device, output_device, config)
 
 

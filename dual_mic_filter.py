@@ -32,6 +32,9 @@ class FilterConfig:
     noise_scale: float = 0.85
     highpass_hz: float = 80.0
     noise_gate_db: float = -45.0
+    enable_vad: bool = True
+    vad_threshold_db: float = -40.0
+    hangover_ms: float = 300.0
 
 
 class DualMicFilter:
@@ -44,6 +47,8 @@ class DualMicFilter:
         )
         self._hp_state = signal.lfilter_zi(self._hp_b, self._hp_a)
         self._delay_samples = self._compute_beam_delay()
+        self._hangover_samples = int((config.hangover_ms / 1000.0) * config.sample_rate)
+        self._hangover_counter = 0
 
     def _compute_beam_delay(self) -> int:
         """End-fire array delay for steering toward beam_angle_deg."""
@@ -69,6 +74,7 @@ class DualMicFilter:
             self._hp_b, self._hp_a, output, zi=self._hp_state
         )
         output = self._apply_noise_gate(output)
+        output = self._apply_vad_gate(output)
         return np.clip(output, -1.0, 1.0)
 
     def _apply_noise_gate(self, audio: np.ndarray) -> np.ndarray:
@@ -77,6 +83,22 @@ class DualMicFilter:
         if rms < threshold:
             return audio * (rms / threshold)
         return audio
+
+    def _apply_vad_gate(self, audio: np.ndarray) -> np.ndarray:
+        if not self.config.enable_vad:
+            return audio
+
+        threshold = 10 ** (self.config.vad_threshold_db / 20.0)
+        rms = np.sqrt(np.mean(audio**2) + 1e-12)
+
+        if rms >= threshold:
+            self._hangover_counter = self._hangover_samples
+            return audio
+        elif self._hangover_counter > 0:
+            self._hangover_counter -= len(audio)
+            return audio
+        else:
+            return np.zeros_like(audio)
 
 
 def list_devices() -> None:
